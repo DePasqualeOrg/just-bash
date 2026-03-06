@@ -405,38 +405,33 @@ describe("tar", () => {
       expect(stat.exitCode).toBe(0);
     });
 
-    it("should extract xz compressed archive", async () => {
+    it("should reject xz decompression by default", async () => {
       const env = new Bash({
         files: {
           "/test.txt": "Hello, xz compressed World!",
         },
       });
       await env.exec("tar -cJvf /archive.tar.xz /test.txt");
-      await env.exec("rm /test.txt");
       const result = await env.exec("tar -xJvf /archive.tar.xz");
-      expect(result.exitCode).toBe(0);
-
-      const cat = await env.exec("cat /test.txt");
-      expect(cat.stdout).toBe("Hello, xz compressed World!");
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain("disabled by default");
+      expect(result.stderr).toContain("native codec");
     });
 
-    it("should auto-detect xz compression on extract", async () => {
+    it("should reject auto-detected xz decompression by default", async () => {
       const env = new Bash({
         files: {
           "/test.txt": "Auto-detect xz!",
         },
       });
       await env.exec("tar -cJf /archive.tar.xz /test.txt");
-      await env.exec("rm /test.txt");
-      // Extract without -J flag - should auto-detect
+      // Extract without -J flag - should auto-detect and still reject
       const result = await env.exec("tar -xf /archive.tar.xz");
-      expect(result.exitCode).toBe(0);
-
-      const cat = await env.exec("cat /test.txt");
-      expect(cat.stdout).toBe("Auto-detect xz!");
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain("disabled by default");
     });
 
-    it("should list xz compressed archive", async () => {
+    it("should reject xz listing by default", async () => {
       const env = new Bash({
         files: {
           "/test.txt": "List xz content",
@@ -444,8 +439,8 @@ describe("tar", () => {
       });
       await env.exec("tar -cJf /archive.tar.xz /test.txt");
       const result = await env.exec("tar -tJf /archive.tar.xz");
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("test.txt");
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain("disabled by default");
     });
   });
 
@@ -1033,36 +1028,38 @@ describe("tar", () => {
       expect(list.stdout).toContain("test.txt");
     });
 
-    it("should auto-detect xz from .tar.xz extension", async () => {
+    it("should auto-detect xz from .tar.xz extension (creation succeeds, listing blocked)", async () => {
       const env = new Bash({
         files: {
           "/test.txt": "Hello World",
         },
       });
 
+      // Creation with xz still works (compressing trusted data)
       const result = await env.exec("tar -caf /archive.tar.xz /test.txt");
       expect(result.exitCode).toBe(0);
 
-      // Verify it's xz compressed
+      // Listing xz archive is blocked by default
       const list = await env.exec("tar -tJf /archive.tar.xz");
-      expect(list.exitCode).toBe(0);
-      expect(list.stdout).toContain("test.txt");
+      expect(list.exitCode).toBe(2);
+      expect(list.stderr).toContain("disabled by default");
     });
 
-    it("should auto-detect zstd from .tar.zst extension", async () => {
+    it("should auto-detect zstd from .tar.zst extension (creation succeeds, listing blocked)", async () => {
       const env = new Bash({
         files: {
           "/test.txt": "Hello World",
         },
       });
 
+      // Creation with zstd still works (compressing trusted data)
       const result = await env.exec("tar -caf /archive.tar.zst /test.txt");
       expect(result.exitCode).toBe(0);
 
-      // Verify it's zstd compressed
+      // Listing zstd archive is blocked by default
       const list = await env.exec("tar --zstd -tf /archive.tar.zst");
-      expect(list.exitCode).toBe(0);
-      expect(list.stdout).toContain("test.txt");
+      expect(list.exitCode).toBe(2);
+      expect(list.stderr).toContain("disabled by default");
     });
 
     it("should create plain tar for .tar extension", async () => {
@@ -1228,7 +1225,7 @@ describe("tar", () => {
       expect(ls.exitCode).toBe(0);
     });
 
-    it("should extract zstd-compressed archive", async () => {
+    it("should reject zstd decompression by default", async () => {
       const env = new Bash({
         files: {
           "/test.txt": "Hello World",
@@ -1236,16 +1233,14 @@ describe("tar", () => {
       });
 
       await env.exec("tar --zstd -cf /archive.tar.zst /test.txt");
-      await env.exec("rm /test.txt");
 
       const result = await env.exec("tar --zstd -xf /archive.tar.zst");
-      expect(result.exitCode).toBe(0);
-
-      const cat = await env.exec("cat /test.txt");
-      expect(cat.stdout).toBe("Hello World");
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain("disabled by default");
+      expect(result.stderr).toContain("native codec");
     });
 
-    it("should auto-detect zstd compression on extract", async () => {
+    it("should reject auto-detected zstd decompression by default", async () => {
       const env = new Bash({
         files: {
           "/test.txt": "Hello World",
@@ -1253,17 +1248,14 @@ describe("tar", () => {
       });
 
       await env.exec("tar --zstd -cf /archive.tar.zst /test.txt");
-      await env.exec("rm /test.txt");
 
-      // Extract without --zstd flag (auto-detect)
+      // Extract without --zstd flag (auto-detect) - still blocked
       const result = await env.exec("tar -xf /archive.tar.zst");
-      expect(result.exitCode).toBe(0);
-
-      const cat = await env.exec("cat /test.txt");
-      expect(cat.stdout).toBe("Hello World");
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain("disabled by default");
     });
 
-    it("should list zstd-compressed archive", async () => {
+    it("should reject zstd listing by default", async () => {
       const env = new Bash({
         files: {
           "/file1.txt": "Content 1",
@@ -1274,9 +1266,8 @@ describe("tar", () => {
       await env.exec("tar --zstd -cf /archive.tar.zst /file1.txt /file2.txt");
 
       const result = await env.exec("tar --zstd -tf /archive.tar.zst");
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("file1.txt");
-      expect(result.stdout).toContain("file2.txt");
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain("disabled by default");
     });
   });
 

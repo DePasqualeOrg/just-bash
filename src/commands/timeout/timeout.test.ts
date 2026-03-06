@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Bash } from "../../Bash.js";
+import { _setTimeout } from "../../timers.js";
 
 describe("timeout command", () => {
   describe("basic functionality", () => {
@@ -17,7 +18,7 @@ describe("timeout command", () => {
       const env = new Bash({
         sleep: async (ms) => {
           // Simulate actual sleep for testing
-          await new Promise((r) => setTimeout(r, ms));
+          await new Promise((r) => _setTimeout(r, ms));
         },
       });
 
@@ -137,6 +138,55 @@ describe("timeout command", () => {
       const result = await env.exec("timeout -s KILL 10 echo test");
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toBe("test\n");
+    });
+  });
+
+  describe("cancellation", () => {
+    it("should not produce output from command after timeout", async () => {
+      const env = new Bash();
+
+      // The inner command sleeps then writes — timeout should prevent the write
+      const result = await env.exec(`
+        timeout 0.01 bash -c 'sleep 0.05; echo SHOULD_NOT_APPEAR > /tmp/cancel-test'
+        exit_code=$?
+        if [ -f /tmp/cancel-test ]; then
+          echo "LEAKED"
+        else
+          echo "CLEAN"
+        fi
+        echo "EXIT=$exit_code"
+      `);
+
+      expect(result.stdout).toBe("CLEAN\nEXIT=124\n");
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("should not accumulate stdout from canceled command", async () => {
+      const env = new Bash();
+
+      const result = await env.exec(`
+        timeout 0.01 bash -c 'sleep 0.05; echo LEAKED_STDOUT'
+      `);
+
+      expect(result.exitCode).toBe(124);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("");
+    });
+
+    it("should abort multi-statement scripts at statement boundary", async () => {
+      const env = new Bash();
+
+      const result = await env.exec(`
+        timeout 0.01 bash -c 'sleep 0.05; echo A > /tmp/a; echo B > /tmp/b; echo C > /tmp/c'
+        echo "EXIT=$?"
+        [ -f /tmp/a ] && echo "A_EXISTS" || echo "A_ABSENT"
+        [ -f /tmp/b ] && echo "B_EXISTS" || echo "B_ABSENT"
+        [ -f /tmp/c ] && echo "C_EXISTS" || echo "C_ABSENT"
+      `);
+
+      expect(result.stdout).toBe("EXIT=124\nA_ABSENT\nB_ABSENT\nC_ABSENT\n");
+      expect(result.exitCode).toBe(0);
     });
   });
 

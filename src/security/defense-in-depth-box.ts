@@ -114,6 +114,8 @@ interface DefenseContext {
   sandboxActive: true;
   /** Unique ID for this execution, useful for correlating violations */
   executionId: string;
+  /** When true, blocking is suspended (trusted infrastructure code) */
+  trusted?: boolean;
 }
 
 // AsyncLocalStorage instance to track whether current async context is within bash.exec()
@@ -163,6 +165,7 @@ export class DefenseInDepthBox {
 
   private config: DefenseInDepthConfig;
   private refCount = 0;
+  private patchFailures: string[] = [];
   private originalDescriptors: Array<{
     target: object;
     prop: string;
@@ -179,13 +182,32 @@ export class DefenseInDepthBox {
   /**
    * Get or create the singleton instance.
    *
-   * @param config - Configuration for the defense box. Only used on first call.
+   * @param config - Configuration for the defense box.
+   * @throws Error if called with a config that conflicts with the existing instance's
+   *         security-relevant settings (enabled, auditMode). This prevents a weaker
+   *         first caller from silently downgrading protection for later callers.
    */
   static getInstance(
     config?: DefenseInDepthConfig | boolean,
   ): DefenseInDepthBox {
+    const resolved = resolveConfig(config);
     if (!DefenseInDepthBox.instance) {
-      DefenseInDepthBox.instance = new DefenseInDepthBox(resolveConfig(config));
+      DefenseInDepthBox.instance = new DefenseInDepthBox(resolved);
+    } else {
+      // Reject conflicting security-relevant config to prevent silent downgrades.
+      // Two configs conflict if they differ on enabled or auditMode.
+      const active = DefenseInDepthBox.instance.config;
+      if (
+        resolved.enabled !== active.enabled ||
+        resolved.auditMode !== active.auditMode
+      ) {
+        throw new Error(
+          `DefenseInDepthBox config conflict: requested {enabled: ${resolved.enabled}, auditMode: ${resolved.auditMode}} ` +
+            `but singleton already has {enabled: ${active.enabled}, auditMode: ${active.auditMode}}. ` +
+            `All Bash instances must use the same defense-in-depth security settings, ` +
+            `or call DefenseInDepthBox.resetInstance() between incompatible configurations.`,
+        );
+      }
     }
     return DefenseInDepthBox.instance;
   }
@@ -251,7 +273,7 @@ export class DefenseInDepthBox {
   activate(): DefenseInDepthHandle {
     // In browser environments, defense-in-depth is disabled (no AsyncLocalStorage)
     // Also disabled when config.enabled is false
-    if (IS_BROWSER || !this.config.enabled) {
+    if (IS_BROWSER || !this.config.enabled || !executionContext) {
       // Return a no-op handle
       const executionId = generateUUID();
       return {
@@ -324,6 +346,13 @@ export class DefenseInDepthBox {
   }
 
   /**
+   * Get the list of patch paths that failed during the last activation.
+   */
+  getPatchFailures(): string[] {
+    return [...this.patchFailures];
+  }
+
+  /**
    * Clear stored violations. Useful for testing.
    */
   clearViolations(): void {
@@ -355,14 +384,48 @@ export class DefenseInDepthBox {
   }
 
   /**
+   * Run a function as trusted infrastructure code.
+   * Blocking is suspended for the current async context only — other
+   * concurrent exec() calls remain protected.
+   *
+   * Uses AsyncLocalStorage to scope the trust, so async operations
+   * spawned inside the callback inherit the trusted state.
+   */
+  static runTrusted<T>(fn: () => T): T {
+    if (!executionContext) return fn();
+    const current = executionContext.getStore();
+    if (!current) return fn();
+    return executionContext.run({ ...current, trusted: true }, fn);
+  }
+
+  /**
+   * Async version of runTrusted.
+   */
+  static async runTrustedAsync<T>(fn: () => Promise<T>): Promise<T> {
+    if (!executionContext) return fn();
+    const current = executionContext.getStore();
+    if (!current) return fn();
+    return executionContext.run({ ...current, trusted: true }, fn);
+  }
+
+  /**
    * Check if current context should be blocked.
-   * Returns false in audit mode, browser environment, or outside sandboxed context.
+   * Returns false in audit mode, browser environment, outside sandboxed context,
+   * inside runTrusted(), or when the immediate caller is a Node.js bundled dep.
    */
   private shouldBlock(): boolean {
     if (IS_BROWSER || this.config.auditMode || !executionContext) {
       return false;
     }
-    return executionContext?.getStore()?.sandboxActive === true;
+    const store = executionContext?.getStore();
+    if (store?.sandboxActive !== true) {
+      return false;
+    }
+    // Trusted infrastructure code (runTrusted) bypasses blocking
+    if (store.trusted) {
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -464,6 +527,7 @@ export class DefenseInDepthBox {
     original: T,
     path: string,
     violationType: SecurityViolationType,
+    allowedKeys?: Set<string>,
   ): T {
     const box = this;
 
@@ -471,6 +535,14 @@ export class DefenseInDepthBox {
     return new Proxy(original, {
       get(target, prop, receiver) {
         if (box.shouldBlock()) {
+          // Allow specific keys through (e.g., Node.js internal env vars)
+          if (
+            allowedKeys &&
+            typeof prop === "string" &&
+            allowedKeys.has(prop)
+          ) {
+            return Reflect.get(target, prop, receiver);
+          }
           const fullPath = `${path}.${String(prop)}`;
           const message = `${fullPath} is blocked during script execution`;
           const violation = box.recordViolation(
@@ -551,6 +623,7 @@ export class DefenseInDepthBox {
    * Apply security patches to dangerous globals.
    */
   private applyPatches(): void {
+    this.patchFailures = [];
     const blockedGlobals = getBlockedGlobals();
 
     // IPC-related globals (process.send, process.channel, process.connected)
@@ -590,6 +663,20 @@ export class DefenseInDepthBox {
     // boolean primitive used by Node.js IPC internals and blocking it
     // interferes with test runners and process managers. It IS blocked in
     // WorkerDefenseInDepth where the entire worker is sandboxed.
+
+    // Fail closed: if any critical patch failed, throw.
+    // Critical patches are those that block the most dangerous escape vectors.
+    const criticalPaths = ["Function.prototype.constructor", "Module._load"];
+    const criticalFailures = this.patchFailures.filter((p) =>
+      criticalPaths.includes(p),
+    );
+    if (criticalFailures.length > 0) {
+      // Restore any patches that did succeed before throwing
+      this.restorePatches();
+      throw new Error(
+        `DefenseInDepthBox: critical patches failed: ${criticalFailures.join(", ")}`,
+      );
+    }
   }
 
   /**
@@ -621,6 +708,7 @@ export class DefenseInDepthBox {
         );
       }
     } catch (e) {
+      this.patchFailures.push("AsyncFunction.prototype.constructor");
       console.debug(
         "[DefenseInDepthBox] Could not patch AsyncFunction.prototype.constructor:",
         e instanceof Error ? e.message : e,
@@ -640,6 +728,7 @@ export class DefenseInDepthBox {
         );
       }
     } catch (e) {
+      this.patchFailures.push("GeneratorFunction.prototype.constructor");
       console.debug(
         "[DefenseInDepthBox] Could not patch GeneratorFunction.prototype.constructor:",
         e instanceof Error ? e.message : e,
@@ -664,6 +753,7 @@ export class DefenseInDepthBox {
         );
       }
     } catch (e) {
+      this.patchFailures.push("AsyncGeneratorFunction.prototype.constructor");
       console.debug(
         "[DefenseInDepthBox] Could not patch AsyncGeneratorFunction.prototype.constructor:",
         e instanceof Error ? e.message : e,
@@ -734,6 +824,7 @@ export class DefenseInDepthBox {
         configurable: true,
       });
     } catch (e) {
+      this.patchFailures.push("Error.prepareStackTrace");
       console.debug(
         "[DefenseInDepthBox] Could not protect Error.prepareStackTrace:",
         e instanceof Error ? e.message : e,
@@ -800,6 +891,7 @@ export class DefenseInDepthBox {
         configurable: true,
       });
     } catch (e) {
+      this.patchFailures.push(path);
       console.debug(
         `[DefenseInDepthBox] Could not patch ${path}:`,
         e instanceof Error ? e.message : e,
@@ -888,6 +980,7 @@ export class DefenseInDepthBox {
         });
       }
     } catch (e) {
+      this.patchFailures.push("process.mainModule");
       console.debug(
         "[DefenseInDepthBox] Could not protect process.mainModule:",
         e instanceof Error ? e.message : e,
@@ -965,6 +1058,7 @@ export class DefenseInDepthBox {
         configurable: true,
       });
     } catch (e) {
+      this.patchFailures.push("process.execPath");
       console.debug(
         "[DefenseInDepthBox] Could not protect process.execPath:",
         e instanceof Error ? e.message : e,
@@ -1032,6 +1126,7 @@ export class DefenseInDepthBox {
         configurable: true,
       });
     } catch (e) {
+      this.patchFailures.push("Module._load");
       console.debug(
         "[DefenseInDepthBox] Could not protect Module._load:",
         e instanceof Error ? e.message : e,
@@ -1076,6 +1171,7 @@ export class DefenseInDepthBox {
                 original as object,
                 path,
                 violationType,
+                blocked.allowedKeys,
               );
 
         Object.defineProperty(target, prop, {
@@ -1086,6 +1182,7 @@ export class DefenseInDepthBox {
       }
     } catch (e) {
       const path = this.getPathForTarget(target, prop);
+      this.patchFailures.push(path);
       console.debug(
         `[DefenseInDepthBox] Could not patch ${path}:`,
         e instanceof Error ? e.message : e,
