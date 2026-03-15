@@ -10,8 +10,13 @@
 import { lookup as dnsLookup } from "node:dns";
 import { DefenseInDepthBox } from "../security/defense-in-depth-box.js";
 import { _clearTimeout, _setTimeout } from "../timers.js";
-import { isPrivateIp, isUrlAllowed, validateAllowList } from "./allow-list.js";
-import type { DnsLookupResult } from "./types.js";
+import {
+  isPrivateIp,
+  isUrlAllowed,
+  matchesAllowListEntry,
+  validateAllowList,
+} from "./allow-list.js";
+import type { AllowedUrl, AllowedUrlEntry, DnsLookupResult } from "./types.js";
 import {
   type FetchResult,
   type HttpMethod,
@@ -50,7 +55,7 @@ const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
 
 export interface SecureFetchOptions {
   method?: string;
-  headers?: Record<string, string>;
+  headers?: Headers | Record<string, string>;
   body?: string;
   followRedirects?: boolean;
   /** Override timeout for this request (capped at global timeout) */
@@ -69,12 +74,50 @@ export type SecureFetch = (
  * Creates a secure fetch function that enforces the allow-list.
  */
 export function createSecureFetch(config: NetworkConfig): SecureFetch {
+  const entries: AllowedUrlEntry[] = config.allowedUrlPrefixes ?? [];
+
   // Fail fast on invalid allow-list entries
   if (!config.dangerouslyAllowFullInternetAccess) {
-    const errors = validateAllowList(config.allowedUrlPrefixes ?? []);
+    const errors = validateAllowList(entries);
     if (errors.length > 0) {
       throw new Error(`Invalid network allow-list:\n${errors.join("\n")}`);
     }
+  }
+
+  // Collect entries that carry transforms for firewall header injection.
+  const transformEntries: AllowedUrl[] = [];
+  for (const entry of entries) {
+    if (
+      typeof entry === "object" &&
+      entry.transform &&
+      entry.transform.length > 0
+    ) {
+      transformEntries.push(entry);
+    }
+  }
+
+  /**
+   * Returns firewall headers for a given URL by matching against transform
+   * entries using URL prefix matching (same logic as the allow-list).
+   *
+   * When multiple entries match (overlapping prefixes), later entries
+   * override earlier ones for the same header name via `set()`. This
+   * means a path-specific `Authorization` overrides an origin-wide one.
+   */
+  function getFirewallHeaders(url: string): Headers | null {
+    if (transformEntries.length === 0) return null;
+    let merged: Headers | null = null;
+    for (const entry of transformEntries) {
+      if (matchesAllowListEntry(url, entry.url) && entry.transform) {
+        if (!merged) merged = new Headers();
+        for (const t of entry.transform) {
+          for (const [key, value] of Object.entries(t.headers)) {
+            merged.set(key, value);
+          }
+        }
+      }
+    }
+    return merged;
   }
 
   const maxRedirects = config.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
@@ -149,7 +192,7 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
       return;
     }
 
-    if (!isUrlAllowed(url, config.allowedUrlPrefixes ?? [])) {
+    if (!isUrlAllowed(url, entries)) {
       throw new NetworkAccessDeniedError(url);
     }
   }
@@ -197,23 +240,31 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
       const timeoutId = _setTimeout(() => controller.abort(), effectiveTimeout);
 
       try {
-        const fetchOptions: RequestInit = {
-          method,
-          headers: options.headers,
-          signal: controller.signal,
-          redirect: "manual", // Handle redirects manually to check allow-list
-        };
+        // Merge user headers with firewall headers (firewall overrides user).
+        // getFirewallHeaders returns a Headers object (which may trigger
+        // undici WASM init), so both header construction and fetch run
+        // inside runTrustedAsync.
+        const response = await DefenseInDepthBox.runTrustedAsync(() => {
+          const firewallHeaders = getFirewallHeaders(currentUrl);
+          const mergedHeaders = buildMergedHeaders(
+            options.headers,
+            firewallHeaders,
+          );
 
-        // Only include body for methods that support it
-        if (options.body && !BODYLESS_METHODS.has(method)) {
-          fetchOptions.body = options.body;
-        }
+          const fetchOptions: RequestInit = {
+            method,
+            headers: mergedHeaders,
+            signal: controller.signal,
+            redirect: "manual", // Handle redirects manually to check allow-list
+          };
 
-        // undici (Node.js fetch) lazily compiles its WASM HTTP parser
-        // on first use, which accesses WebAssembly — a blocked global.
-        const response = await DefenseInDepthBox.runTrustedAsync(() =>
-          fetch(currentUrl, fetchOptions),
-        );
+          // Only include body for methods that support it
+          if (options.body && !BODYLESS_METHODS.has(method)) {
+            fetchOptions.body = options.body;
+          }
+
+          return fetch(currentUrl, fetchOptions);
+        });
 
         // Check for redirects
         if (REDIRECT_CODES.has(response.status) && followRedirects) {
@@ -254,6 +305,35 @@ export function createSecureFetch(config: NetworkConfig): SecureFetch {
   }
 
   return secureFetch;
+}
+
+/**
+ * Merges user headers with firewall headers.
+ *
+ * Accepts both `Headers` and plain `Record<string, string>` for backward
+ * compatibility. User headers are copied first, then firewall headers are
+ * `set()` on top so they always override — the sandbox cannot substitute
+ * credentials. Multi-value user headers (added via `Headers.append()`)
+ * are preserved for names that the firewall does not override.
+ */
+function buildMergedHeaders(
+  userHeaders: Headers | Record<string, string> | undefined,
+  firewallHeaders: Headers | null,
+): Headers | Record<string, string> | undefined {
+  if (!userHeaders && !firewallHeaders) return undefined;
+  // Fast path: no firewall headers, pass user headers through unchanged
+  if (!firewallHeaders) return userHeaders;
+  const merged =
+    userHeaders instanceof Headers
+      ? new Headers(userHeaders)
+      : new Headers(userHeaders);
+  // Firewall headers override user headers (security).
+  // Use set() so firewall values replace any user-supplied value for the
+  // same header name (case-insensitive).
+  for (const [k, v] of firewallHeaders) {
+    merged.set(k, v);
+  }
+  return merged;
 }
 
 /**
